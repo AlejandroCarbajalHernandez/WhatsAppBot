@@ -1,0 +1,14 @@
+# Ignorar binarios y estados de Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# Ignorar variables sensibles (Tokens de Meta)
+*.tfvars
+
+# Ignorar archivos del sistema y Python
+__pycache__/
+.DS_Store.terraform/
+*.tfstate
+.terraform.lock.hcl
