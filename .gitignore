@@ -10,5 +10,6 @@
 # Ignorar archivos del sistema y Python
 __pycache__/
 .DS_Store.terraform/
+.DS_Store
 *.tfstate
 .terraform.lock.hcl
