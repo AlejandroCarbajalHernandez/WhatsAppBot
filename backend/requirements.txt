@@ -1,0 +1,5 @@
+Flask==3.0.2
+Flask-CORS==4.0.0
+boto3==1.34.34
+reportlab==4.1.0
+aws-wsgi==0.2.7

@@ -1,0 +1,794 @@
+================================================================================
+FILE: src/requirements.txt
+================================================================================
+boto3>=1.34.0      # Para hablar con Bedrock
+requests           # Para hablar con la API de WhatsApp
+
+
+================================================================================
+FILE: src/populate_appointments.py
+================================================================================
+import boto3
+from datetime import datetime, timedelta
+
+# Configuración
+REGION = "us-east-1"
+# Sustituye con el nombre real de tu tabla si es diferente
+TABLE_NAME = "agencia-lujo-medical-appointments" 
+
+dynamodb = boto3.resource('dynamodb', region_name=REGION)
+table = dynamodb.Table(TABLE_NAME)
+
+def populate():
+    doctor_id = "DOC-001"
+    # Hoy es lunes 26 de enero de 2026
+    start_date = datetime(2026, 1, 27) # Empezamos disponibilidad desde mañana martes
+    
+    # Generamos espacios para los próximos 3 días
+    for i in range(3):
+        current_date = (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
+        
+        # Horarios de oficina: 09:00, 10:00, 11:00, 12:00
+        slots = ["09:00", "10:00", "11:00", "12:00"]
+        
+        for slot in slots:
+            appointment_id = f"{current_date}#{slot}"
+            
+            print(f"Insertando: {appointment_id}...")
+            
+            table.put_item(
+                Item={
+                    'doctor_id': doctor_id,
+                    'appointment_id': appointment_id,
+                    'appointment_date': current_date,
+                    'availability_status': 'disponible',
+                    'patient_phone': 'ninguno'
+                }
+            )
+
+if __name__ == "__main__":
+    try:
+        populate()
+        print("\n✅ ¡Éxito! Horarios de prueba insertados para el 27, 28 y 29 de enero.")
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+
+
+================================================================================
+FILE: src/appointments.py
+================================================================================
+import os
+import json
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
+# Inicialización de recursos
+dynamodb = boto3.resource('dynamodb')
+# Asegúrate de que esta variable de entorno esté en tu main.tf
+table = dynamodb.Table(os.environ['APPOINTMENTS_TABLE'])
+
+def lambda_handler(event, context):
+    print(f"Evento recibido: {json.dumps(event)}")
+    
+    action_group = event['actionGroup']
+    api_path = event['apiPath']
+    http_method = event['httpMethod']
+    
+    # Extraer parámetros del Agente
+    parameters = {p['name']: p['value'] for p in event.get('parameters', [])}
+    date = parameters.get('date')
+    
+    # Atributos de sesión para identificar al usuario
+    session_attrs = event.get('sessionAttributes', {})
+    user_phone = session_attrs.get('user_phone', 'Desconocido')
+
+    response_code = 200
+    result_body = {}
+
+    try:
+        # --- CASO 1: CONSULTAR DISPONIBILIDAD (/availability) ---
+        if api_path == '/availability':
+            # Buscamos en el GSI 'DateIndex' todos los horarios para esa fecha
+            response = table.query(
+                IndexName='DateIndex',
+                KeyConditionExpression=Key('appointment_date').eq(date)
+            )
+            
+            # Filtramos solo los que están marcados como 'disponible'
+            items = response.get('Items', [])
+            available_slots = [
+                item['appointment_id'].split('#')[1] 
+                for item in items 
+                if item.get('availability_status') == 'disponible'
+            ]
+            
+            if available_slots:
+                # El nombre 'available_hours' debe coincidir con tu API Schema en Terraform
+                result_body = {"available_hours": available_slots}
+            else:
+                result_body = {"available_hours": [], "message": f"No hay horarios disponibles para el día {date}."}
+
+        # --- CASO 2: AGENDAR CITA (/book) ---
+        elif api_path == '/book':
+            time = parameters.get('time')
+            appointment_id = f"{date}#{time}"
+            
+            try:
+                # Intentamos actualizar solo si el estado actual es 'disponible'
+                table.update_item(
+                    Key={'doctor_id': 'DOC-001', 'appointment_id': appointment_id},
+                    UpdateExpression="SET availability_status = :r, patient_phone = :p",
+                    ConditionExpression="availability_status = :d",
+                    ExpressionAttributeValues={
+                        ':r': 'reservado',
+                        ':p': user_phone,
+                        ':d': 'disponible'
+                    }
+                )
+                result_body = {"message": f"¡Cita confirmada! Te esperamos el {date} a las {time}."}
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                    result_body = {"message": "Lo siento, ese horario ya no está disponible."}
+                    response_code = 400
+                else:
+                    raise e
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        result_body = {"message": "Error interno al procesar la solicitud."}
+        response_code = 500
+
+    # --- FORMATO DE RESPUESTA FINAL PARA BEDROCK AGENTS ---
+    # Esto es lo que permite que el 'observation' del trace no llegue vacío
+    response_body = {
+        'application/json': {
+            'body': json.dumps(result_body)
+        }
+    }
+
+    action_response = {
+        'actionGroup': action_group,
+        'apiPath': api_path,
+        'httpMethod': http_method,
+        'httpStatusCode': response_code,
+        'responseBody': response_body
+    }
+
+    api_response = {
+        'messageVersion': '1.0',
+        'response': action_response
+    }
+
+    return api_response
+
+
+================================================================================
+FILE: src/app.py
+================================================================================
+import os, json, boto3, requests
+from datetime import datetime
+
+# Clientes
+bedrock = boto3.client(service_name='bedrock-agent-runtime', region_name='us-east-1')
+dynamodb = boto3.resource('dynamodb')
+history_table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+def lambda_handler(event, context):
+    # --- Validación de Webhook de Meta (GET) ---
+    if event.get('httpMethod') == 'GET':
+        params = event.get('queryStringParameters', {})
+        if params.get('hub.verify_token') == os.environ.get('VERIFY_TOKEN'):
+            return {'statusCode': 200, 'body': params.get('hub.challenge')}
+        return {'statusCode': 403}
+
+    try:
+        body = json.loads(event.get('body', '{}'))
+        value = body.get('entry', [{}])[0].get('changes', [{}])[0].get('value', {})
+        
+        if 'messages' not in value:
+            return {'statusCode': 200}
+
+        user_phone = value['messages'][0]['from']
+        user_text = value['messages'][0]['text']['body']
+
+        # 1. Guardar mensaje del usuario en DynamoDB
+        history_table.put_item(Item={
+            'SessionId': user_phone,
+            'Timestamp': datetime.utcnow().isoformat(),
+            'Role': 'user',
+            'Text': user_text
+        })
+
+        # 2. Llamada al Agente usando TSTALIASID
+        # Importante: Habilitamos enableTrace para ver qué pasa si falla
+        response = bedrock.invoke_agent(
+            agentId=os.environ['AGENT_ID'],
+            agentAliasId='TSTALIASID',
+            sessionId=user_phone,
+            inputText=user_text,
+            enableTrace=True, 
+            sessionState={'sessionAttributes': {'user_phone': user_phone}}
+        )
+
+        ai_reply = ""
+        
+        # 3. Procesar el streaming de respuesta
+        for event in response.get('completion', []):
+            # Si el agente genera texto para el usuario
+            if 'chunk' in event:
+                chunk_text = event['chunk']['bytes'].decode('utf-8')
+                # Filtramos para que no se escape el nombre de la función en el chat
+                if "getAvailability" not in chunk_text and "bookAppointment" not in chunk_text:
+                    ai_reply += chunk_text
+            
+            # Si el agente está pensando o llamando a la Lambda (Trace)
+            elif 'trace' in event:
+                # Esto se verá en los logs de CloudWatch de ESTA Lambda
+                # Muy útil para debuguear por qué no se llama a la otra Lambda
+                print(f"DEBUG TRACE: {json.dumps(event['trace'])}")
+
+        # 4. Solo procedemos si el Agente entregó una respuesta final
+        if ai_reply.strip():
+            # Guardar respuesta de la IA
+            history_table.put_item(Item={
+                'SessionId': user_phone,
+                'Timestamp': datetime.utcnow().isoformat(),
+                'Role': 'assistant',
+                'Text': ai_reply
+            })
+
+            # Enviar a WhatsApp
+            send_whatsapp(user_phone, ai_reply)
+        else:
+            print("El agente no generó respuesta de texto (posible espera de herramienta o error).")
+
+    except Exception as e:
+        print(f"Error General: {str(e)}")
+    
+    return {'statusCode': 200}
+
+def send_whatsapp(phone, text):
+    # Asegúrate de tener estas variables en tu Lambda
+    token = os.environ.get('FB_TOKEN')
+    phone_id = os.environ.get('PHONE_ID')
+    url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
+    
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "text",
+        "text": {"body": text}
+    }
+    
+    r = requests.post(url, json=payload, headers=headers)
+    print(f"WhatsApp Status: {r.status_code}, Response: {r.text}")
+
+
+================================================================================
+FILE: terraform/outputs.tf
+================================================================================
+output "whatsapp_callback_url" {
+  description = "URL que debes pegar en el campo 'Callback URL' de Meta"
+  # Referenciamos el nuevo nombre del recurso definido en el main.tf
+  value       = aws_lambda_function_url.webhook_url.function_url
+}
+
+output "verify_token_to_use" {
+  description = "Token que debes pegar en el campo 'Verify Token' de Meta"
+  value       = var.verify_token
+}
+
+output "webhook_ecr_url" {
+  description = "URL del repositorio ECR para el Webhook"
+  value       = aws_ecr_repository.webhook_repo.repository_url
+}
+
+
+================================================================================
+FILE: terraform/main.tf
+================================================================================
+# 1. Configuración del Proveedor
+provider "aws" {
+  region = var.aws_region
+}
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+data "aws_caller_identity" "current" {}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# ---------------------------------------------------------
+# 2. ROLES DE IAM UNIFICADOS (Resuelve errores de referencias)
+# ---------------------------------------------------------
+
+# Rol para Bedrock (Agente + Knowledge Base)
+resource "aws_iam_role" "bedrock_unified_role" {
+  name = "${var.client_name}-bedrock-unified-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "bedrock.amazonaws.com" # Esto permite que Bedrock use el rol
+        }
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = "783810475032" # Reemplaza con tu ID de cuenta
+          }
+          ArnLike = {
+            "aws:SourceArn" = "arn:aws:bedrock:us-east-1:783810475032:agent/*"
+          }
+        }
+      }
+    ]
+  })
+}
+resource "aws_iam_role_policy" "bedrock_unified_policy" {
+  name = "${var.client_name}-bedrock-policy"
+  role = aws_iam_role.bedrock_unified_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Action = ["s3:*", "s3vectors:*", "bedrock:*", "lambda:InvokeFunction"], Effect = "Allow", Resource = "*" }
+    ]
+  })
+}
+
+# Rol para Lambdas (Webhook + Acción)
+resource "aws_iam_role" "lambda_unified_role" {
+  name = "${var.client_name}-lambda-unified-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_permissions" {
+  name = "${var.client_name}-lambda-policy"
+  role = aws_iam_role.lambda_unified_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Action = ["bedrock:InvokeAgent", "dynamodb:*", "logs:*"], Effect = "Allow", Resource = "*" }
+    ]
+  })
+}
+
+# ---------------------------------------------------------
+# 3. REPOSITORIOS ECR Y DOCKER
+# ---------------------------------------------------------
+
+resource "aws_ecr_repository" "webhook_repo" {
+  name                 = "${var.client_name}-webhook"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true 
+}
+
+resource "aws_ecr_repository" "action_repo" {
+  name                 = "${var.client_name}-action-executor"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true 
+}
+
+resource "null_resource" "docker_push" {
+  triggers = {
+    webhook_code = md5(file("../src/app.py"))
+    action_code  = md5(file("../src/appointments.py"))
+  }
+
+  provisioner "local-exec" {
+    command = <<EOF
+      aws ecr get-login-password --region ${var.aws_region} | docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com
+      docker buildx build --platform linux/amd64 --provenance=false -t ${var.client_name}-webhook:latest -f ../Dockerfile --build-arg ENTRY_POINT=app.lambda_handler ../
+      docker tag ${var.client_name}-webhook:latest ${aws_ecr_repository.webhook_repo.repository_url}:latest
+      docker push ${aws_ecr_repository.webhook_repo.repository_url}:latest
+      docker buildx build --platform linux/amd64 --provenance=false -t ${var.client_name}-action:latest -f ../Dockerfile --build-arg ENTRY_POINT=appointments.lambda_handler ../
+      docker tag ${var.client_name}-action:latest ${aws_ecr_repository.action_repo.repository_url}:latest
+      docker push ${aws_ecr_repository.action_repo.repository_url}:latest
+    EOF
+  }
+}
+
+# ---------------------------------------------------------
+# 4. DYNAMODB (Sintaxis Corregida - Resuelve Error línea 88)
+# ---------------------------------------------------------
+# Tabla para guardar el historial de chat (Sesiones de WhatsApp)
+resource "aws_dynamodb_table" "history" {
+  name           = "${var.client_name}-chat-history"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "SessionId"
+  range_key      = "Timestamp" # Esto soluciona el error de "Unused attributes"
+
+  attribute {
+    name = "SessionId"
+    type = "S"
+  }
+
+  attribute {
+    name = "Timestamp"
+    type = "S"
+  }
+
+  # Mantenemos el TTL para la limpieza automática
+  ttl {
+    attribute_name = "TimeToExist"
+    enabled        = true
+  }
+
+  tags = { 
+    Client = var.client_name 
+  }
+}
+resource "aws_dynamodb_table" "appointments" {
+  name           = "${var.client_name}-medical-appointments"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "doctor_id"
+  range_key      = "appointment_id"
+
+  attribute {
+    name = "doctor_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "appointment_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "appointment_date"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name               = "DateIndex"
+    hash_key           = "appointment_date"
+    projection_type    = "ALL"
+  }
+
+  tags = { Client = var.client_name }
+}
+
+# ---------------------------------------------------------
+# 5. BEDROCK KB Y AGENTE (Referencias Corregidas)
+# ---------------------------------------------------------
+
+resource "aws_s3_bucket" "raw_data_bucket" {
+  bucket        = "${var.client_name}-raw-docs-${random_id.suffix.hex}"
+  force_destroy = true
+}
+
+resource "aws_s3vectors_vector_bucket" "vector_store" {
+  vector_bucket_name = "${var.client_name}-vectors-${random_id.suffix.hex}"
+}
+
+resource "aws_s3vectors_index" "kb_index" {
+  vector_bucket_name = aws_s3vectors_vector_bucket.vector_store.vector_bucket_name
+  index_name         = "${var.client_name}-index"
+  data_type          = "float32"
+  dimension          = 1024
+  distance_metric    = "cosine"
+}
+
+resource "aws_bedrockagent_knowledge_base" "kb" {
+  name     = "${var.client_name}-kb"
+  role_arn = aws_iam_role.bedrock_unified_role.arn # Referencia Corregida
+
+  knowledge_base_configuration {
+    type = "VECTOR"
+    vector_knowledge_base_configuration {
+      embedding_model_arn = "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0"
+    }
+  }
+
+  storage_configuration {
+    type = "S3_VECTORS"
+    s3_vectors_configuration {
+      vector_bucket_arn = aws_s3vectors_vector_bucket.vector_store.vector_bucket_arn
+      index_name        = aws_s3vectors_index.kb_index.index_name
+    }
+  }
+}
+
+resource "aws_bedrockagent_agent" "doctor_assistant" {
+  agent_name                  = "${var.client_name}-agent"
+  agent_resource_role_arn      = aws_iam_role.bedrock_unified_role.arn # Referencia Corregida
+  foundation_model            = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+  instruction = <<EOT
+    Eres un asistente virtual médico para el cliente ${var.client_name}. 
+    REGLAS DE COMUNICACIÓN CRÍTICAS:
+    - TRABAJA EN SILENCIO: No narres tus acciones. NUNCA digas frases como "Voy a consultar...", "Permítame llamar a la función..." o "Estoy revisando la disponibilidad".
+    - Ve directo al resultado: Si el usuario pregunta por horarios, ejecuta la función y responde directamente con los datos obtenidos.
+    - NUNCA escribas nombres de funciones como 'get_available_appointments()' o bloques de código en el chat.
+    - El usuario NUNCA debe ver cómo trabajas internamente.
+    - Solo responde con texto natural y profesional una vez que tengas los datos de la herramienta.
+    - Si vas a usar una herramienta, hazlo en silencio y solo muestra el resultado final.
+    - Tu tono debe ser profesional, ejecutivo y breve.
+    REGLAS TÉCNICAS:
+    1. No tienes acceso a ninguna agenda interna por tu cuenta. 
+    2. Para CUALQUIER pregunta sobre horarios, DEBES invocar la función 'getAvailability' del grupo 'CitasMedicas'. 
+    3. ESTÁ PROHIBIDO inventar horas. Solo usa lo que devuelva la función. 
+    4. Si el usuario quiere agendar, DEBES usar la función 'bookAppointment' y confirmar el éxito.
+    5. Si no hay horarios, informa que no hay disponibilidad sin sugerir horas falsas.
+   
+    Fecha actual: 2026-01-29.
+EOT
+}
+
+resource "aws_bedrockagent_agent_alias" "agent_alias" {
+  agent_id         = aws_bedrockagent_agent.doctor_assistant.id
+  agent_alias_name = "prod"
+}
+
+# Resuelve Error línea 198 (Missing required arguments)
+resource "aws_bedrockagent_agent_knowledge_base_association" "kb_assoc" {
+  agent_id             = aws_bedrockagent_agent.doctor_assistant.id
+  knowledge_base_id    = aws_bedrockagent_knowledge_base.kb.id
+  agent_version        = "DRAFT"
+  description          = "Base de conocimientos médicos y protocolos del doctor."
+  knowledge_base_state = "ENABLED" 
+}
+
+# ---------------------------------------------------------
+# 6. LAMBDAS Y ACCIONES
+# ---------------------------------------------------------
+
+resource "aws_lambda_function" "whatsapp_webhook" {
+  function_name = "${var.client_name}-webhook-handler"
+  role          = aws_iam_role.lambda_unified_role.arn
+  package_type  = "Image"
+  image_uri     = "${aws_ecr_repository.webhook_repo.repository_url}:latest"
+  image_config {
+    command = ["app.lambda_handler"] # Forzamos el handler aquí
+  }
+  timeout       = 30
+
+  environment {
+    variables = {
+      AGENT_ID       = aws_bedrockagent_agent.doctor_assistant.id
+      AGENT_ALIAS_ID = aws_bedrockagent_agent_alias.agent_alias.agent_alias_id
+      WHATSAPP_TOKEN = var.whatsapp_token
+      PHONE_NUMBER_ID = var.phone_number_id
+      TABLE_NAME     = aws_dynamodb_table.history.name
+    }
+  }
+  depends_on = [null_resource.docker_push]
+}
+
+resource "aws_lambda_function" "appointment_action" {
+  function_name = "${var.client_name}-action-executor"
+  role          = aws_iam_role.lambda_unified_role.arn
+  package_type  = "Image"
+  image_uri     = "${aws_ecr_repository.action_repo.repository_url}:latest"
+  image_config {
+    command = ["appointments.lambda_handler"] 
+  }
+  timeout       = 30
+
+  environment {
+    variables = {
+      APPOINTMENTS_TABLE = aws_dynamodb_table.appointments.name
+    }
+  }
+  depends_on = [null_resource.docker_push]
+}
+
+resource "aws_bedrockagent_agent_action_group" "actions" {
+  action_group_name          = "CitasMedicas"
+  action_group_state         = "ENABLED" # <--- Agrégala aquí
+  agent_id                   = aws_bedrockagent_agent.doctor_assistant.id
+  agent_version              = "DRAFT"
+  depends_on = [aws_lambda_permission.allow_agent]
+  
+  action_group_executor {
+    lambda = aws_lambda_function.appointment_action.arn
+  }
+
+  api_schema {
+    payload = jsonencode({
+      openapi = "3.0.0"
+      info = {
+        title   = "API de Citas AHCloud"
+        version = "1.0.0"
+        description = "API para consultar disponibilidad y agendar citas médicas"
+      }
+      paths = {
+        "/availability" = {
+          get = {
+            summary     = "Consultar disponibilidad"
+            description = "REQUIRED: Consulta la base de datos DynamoDB para obtener horarios REALES. PROHIBIDO responder sin llamar a esta funcion primero."
+            operationId = "getAvailability"
+            parameters = [
+              {
+                name        = "date"
+                in          = "query"
+                required    = true
+                description = "Fecha en formato YYYY-MM-DD"
+                schema      = { type = "string" }
+              }
+            ]
+            responses = {
+              "200" = {
+                description = "Lista de horarios disponibles"
+                content = {
+                  "application/json" = {
+                    schema = {
+                      type = "object"
+                      properties = {
+                        available_hours = {
+                          type  = "array"
+                          items = { type = "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        "/book" = {
+          post = {
+            summary     = "Agendar cita"
+            description = "Reserva una cita en un horario especifico"
+            operationId = "bookAppointment"
+            parameters = [
+              {
+                name        = "date"
+                in          = "query"
+                required    = true
+                description = "Fecha de la cita (YYYY-MM-DD)"
+                schema      = { type = "string" }
+              },
+              {
+                name        = "time"
+                in          = "query"
+                required    = true
+                description = "Hora de la cita (HH:MM)"
+                schema      = { type = "string" }
+              }
+            ]
+            responses = {
+              "200" = {
+                description = "Confirmacion de la reserva exitosa"
+                content = {
+                  "application/json" = {
+                    schema = {
+                      type = "object"
+                      properties = {
+                        message = { type = "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    })
+  }
+}
+
+resource "aws_lambda_permission" "allow_agent" {
+  statement_id  = "AllowBedrockInvocation"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.appointment_action.function_name
+  principal     = "bedrock.amazonaws.com"
+  source_arn    = aws_bedrockagent_agent.doctor_assistant.agent_arn
+
+  # Esto asegura que el Agente ya exista por completo antes de intentar darle permiso
+  depends_on = [aws_bedrockagent_agent.doctor_assistant]
+}
+
+resource "aws_lambda_function_url" "webhook_url" {
+  function_name      = aws_lambda_function.whatsapp_webhook.function_name
+  authorization_type = "NONE"
+}
+resource "aws_bedrockagent_agent_alias" "current" {
+  agent_alias_name = "prod_alias"
+  agent_id         = aws_bedrockagent_agent.doctor_assistant.id
+
+  # Este bloque fuerza a que el agente se "prepare" y publique 
+  # cada vez que cambie el código o el esquema
+  provisioner "local-exec" {
+    command = "aws bedrock-agent prepare-agent --agent-id ${aws_bedrockagent_agent.doctor_assistant.id}"
+  }
+}
+
+
+================================================================================
+FILE: terraform/terraform.tfvars
+================================================================================
+phone_number_id = "884803311392179"
+whatsapp_token  = "EAAK2DSC8ikMBQX6TcstkGmlAhLzdJQeiZBBcJUOyKfT37PgRbJqWpFWcxsQWTSGb0uWsAXwxbtYn5EjUbmrBkLZBX69ZC0pTxqETrND0BiTpoZC4hf3TvUPOOLi5LPQL82nqrGWkst7alTIN98ctmjWDcmjVZAxZBEmg0Wj8X73IHhtjQLJfMnl3pfmUki2VaZA4QZDZD"
+
+verify_token           = "AHCloud_Secret_2026"
+recipient_phone_number = "525565369498"
+api_version            = "v24.0"
+
+
+================================================================================
+FILE: terraform/variables.tf
+================================================================================
+variable "client_name" {
+  description = "Nombre del cliente para prefijar los recursos"
+  type        = string
+  default     = "agencia-lujo"
+}
+
+variable "aws_region" {
+  description = "Región de AWS"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "verify_token" {
+  description = "Token secreto para validar el webhook en Meta"
+  type        = string
+  # No pongas default aquí, deja que lo lea de tfvars
+}
+
+variable "whatsapp_token" {
+  description = "Token de acceso permanente de Meta"
+  type        = string
+  sensitive   = true 
+}
+
+variable "phone_number_id" {
+  description = "Identificador del número de teléfono en Meta"
+  type        = string
+}
+variable "api_version" {
+  description = "Versión de la API de Graph de Meta (ej. v21.0)"
+  type        = string
+  default     = "v24.0"
+}
+
+variable "recipient_phone_number" {
+  description = "Tu número personal para pruebas (formato 52...)"
+  type        = string
+}
+
+
+================================================================================
+FILE: Dockerfile
+================================================================================
+# Forzamos la arquitectura x86_64 que es la estándar de Lambda
+FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
+
+# Definimos el argumento de construcción
+ARG ENTRY_POINT
+
+# Instalamos dependencias
+COPY src/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiamos el código
+COPY src/ ${LAMBDA_TASK_ROOT}/
+
+# TRUCO PRO: Sobrescribimos el CMD directamente con el valor del argumento
+# Esto evita que Lambda intente buscar una variable de entorno en tiempo de ejecución
+ENV LAMBDA_HANDLER_VALUE=${ENTRY_POINT}
+CMD [ "app.lambda_handler" ]
+
+
