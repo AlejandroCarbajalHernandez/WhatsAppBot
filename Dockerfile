@@ -5,4 +5,4 @@ FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 COPY src/requirements.txt .
 RUN pip install -r requirements.txt
 COPY src/app.py ${LAMBDA_TASK_ROOT}
-CMD [ "app.handler" ]
+CMD [ "app.lambda_handler" ]
